@@ -5,7 +5,7 @@
 
 using namespace std;
 
-#define NUM_COMPUTE 3
+#define NUM_COMPUTE 10
 #define READ_THREAD 0
 #define WRITE_THREAD (READ_THREAD + NUM_COMPUTE + 1)
 #define ITERATIONS 100
@@ -20,18 +20,21 @@ std::atomic_flag output_cons_ready;
 std::atomic_flag output_cons_valid;
 
 // Compute sync variables
+std::atomic_flag compute_ready[WRITE_THREAD];
 std::atomic_flag compute_valid[WRITE_THREAD];
 
-std::mutex ping_mutex[WRITE_THREAD];
-std::mutex pong_mutex[WRITE_THREAD];
+std::mutex mtx[WRITE_THREAD+1];
 
 unsigned input_mem[NUM_ELEM];
-unsigned ping_mem[WRITE_THREAD][NUM_ELEM];
-unsigned pong_mem[WRITE_THREAD][NUM_ELEM];
+unsigned mem[WRITE_THREAD+1][NUM_ELEM];
 unsigned output_mem[NUM_ELEM];
 
+long long unsigned counter;
+
 void read_input (unsigned exec_time_factor) {
-    bool pingpong = true;
+    bitset<WRITE_THREAD+1> mem_arbiter;
+    mem_arbiter.reset();
+    mem_arbiter.set(0);
     // ofstream outfile;
     // outfile.open("read_input.log");
 
@@ -45,39 +48,49 @@ void read_input (unsigned exec_time_factor) {
         // Wait for new input from producer
         while(!input_prod_valid.test(std::memory_order_seq_cst));
 
-        if (pingpong) {
-            // ping_mutex[0].lock();
-            for (unsigned j = 0; j < NUM_ELEM; j++) {
-                ping_mem[0][j] = input_mem[j]+1;
-                // outfile << "iterations = " << i << " input_mem = " << input_mem[j] << " ping_mem = " << ping_mem[0][j] << endl;
+        // Wait for Compute 1 to be ready
+        while(!compute_ready[0].test(std::memory_order_seq_cst));
+
+        for (unsigned j = 0; j < WRITE_THREAD+1; j++) {
+            if (mem_arbiter.test(j)) {
+                // mtx[j].lock();
+                for (unsigned k = 0; k < NUM_ELEM; k++) {
+                    mem[j][k] = input_mem[k]+1;
+                    // outfile << counter << " iterations = " << i << " input_mem = " << input_mem[k] << " mem " << j << " = " << mem[j][k] << endl;
+                }
+                // mtx[j].unlock();
+
+                mem_arbiter.reset();
+                if (j == WRITE_THREAD) mem_arbiter.set(0);
+                else mem_arbiter.set(j+1);
+
+                break;
             }
-            // ping_mutex[0].unlock();
-        } else {
-            // pong_mutex[0].lock();
-            for (unsigned j = 0; j < NUM_ELEM; j++) {
-                pong_mem[0][j] = input_mem[j]+1;
-                // outfile << "iterations = " << i << " input_mem = " << input_mem[j] << " pong_mem = " << pong_mem[0][j] << endl;
-            }
-            // pong_mutex[0].unlock();
         }
 
         // Reset producer valid flag
         input_prod_valid.clear(std::memory_order_seq_cst);
+
+        // Reset Compute 1 ready flag
+        compute_ready[0].clear(std::memory_order_seq_cst);
 
         // Test and Set producer ready flag
         while(input_prod_ready.test_and_set(std::memory_order_seq_cst));
 
         // Test and Set Compute 1 flag
         while(compute_valid[0].test_and_set(std::memory_order_seq_cst));
-
-        pingpong = !pingpong;
     }
 }
 
 void store_output (unsigned exec_time_factor) {
-    bool pingpong = true;
+    bitset<WRITE_THREAD+1> mem_arbiter;
+    mem_arbiter.reset();
+    mem_arbiter.set(0);
     // ofstream outfile;
     // outfile.open("store_output.log");
+
+    // Test and Set Compute <NUM_COMPUTE> ready flag
+    while(compute_ready[NUM_COMPUTE].test_and_set(std::memory_order_seq_cst));
 
     for (unsigned i = 0; i < ITERATIONS; i++) {
         // Test Compute <NUM_COMPUTE> flag
@@ -86,20 +99,21 @@ void store_output (unsigned exec_time_factor) {
         // Wait for consumer to be ready
         while(!output_cons_ready.test(std::memory_order_seq_cst));
 
-        if (pingpong) {
-            // ping_mutex[NUM_COMPUTE].lock();
-            for (unsigned j = 0; j < NUM_ELEM; j++) {
-                output_mem[j] = ping_mem[NUM_COMPUTE][j]+1;
-                // outfile << "iterations = " << i << " ping_mem = " << ping_mem[NUM_COMPUTE][j] << " output_mem = " << output_mem[j] << endl;
+        for (unsigned j = 0; j < WRITE_THREAD+1; j++) {
+            if (mem_arbiter.test(j)) {
+                // mtx[j].lock();
+                for (unsigned k = 0; k < NUM_ELEM; k++) {
+                    output_mem[k] = mem[j][k]+1;
+                    // outfile << counter << " iterations = " << i << " mem " << j << " = " << mem[j][k] << " output_mem = " << output_mem[k] << endl;
+                }
+                // mtx[j].unlock();
+
+                mem_arbiter.reset();
+                if (j == WRITE_THREAD) mem_arbiter.set(0);
+                else mem_arbiter.set(j+1);
+
+                break;
             }
-            // ping_mutex[NUM_COMPUTE].unlock();
-        } else {
-            // pong_mutex[NUM_COMPUTE].lock();
-            for (unsigned j = 0; j < NUM_ELEM; j++) {
-                output_mem[j] = pong_mem[NUM_COMPUTE][j]+1;
-                // outfile << "iterations = " << i << " pong_mem = " << pong_mem[NUM_COMPUTE][j] << " output_mem = " << output_mem[j] << endl;
-            }
-            // pong_mutex[NUM_COMPUTE].unlock();
         }
 
         // Reset consumer ready flag
@@ -111,12 +125,15 @@ void store_output (unsigned exec_time_factor) {
         // Test and Set consumer valid flag
         while(output_cons_valid.test_and_set(std::memory_order_seq_cst));
 
-        pingpong = !pingpong;
+        // Test and Set Compute <NUM_COMPUTE> ready flag
+        while(compute_ready[NUM_COMPUTE].test_and_set(std::memory_order_seq_cst));
     }
 }
 
 void compute_kernel (unsigned id, unsigned exec_time_factor) {
-    bool pingpong = true;
+    bitset<WRITE_THREAD+1> mem_arbiter;
+    mem_arbiter.reset();
+    mem_arbiter.set(0);
     // ofstream outfile;
     // string filename = "compute_kernel_"+to_string(id)+".log";
     // outfile.open(filename);
@@ -124,37 +141,45 @@ void compute_kernel (unsigned id, unsigned exec_time_factor) {
     // Reset Compute <id+1> flag
     compute_valid[id+1].clear(std::memory_order_seq_cst);
 
+    // Test and Set Compute <id> ready flag
+    while(compute_ready[id].test_and_set(std::memory_order_seq_cst));
+
     for (unsigned i = 0; i < ITERATIONS; i++) {
-        // Test Compute <id> flag
+        // Test Compute <id> valid flag
         while(!compute_valid[id].test(std::memory_order_seq_cst));
 
-        if (pingpong) {
-            // ping_mutex[id].lock();
-            // ping_mutex[id+1].lock();
-            for (unsigned j = 0; j < NUM_ELEM; j++) {
-                ping_mem[id+1][j] = ping_mem[id][j]+1;
-                // outfile << "iterations = " << i << " ping_mem = " << ping_mem[id][j] << " ping_mem = " << ping_mem[id+1][j] << endl;
+        // Test Compute <id+1> ready flag
+        while(!compute_ready[id+1].test(std::memory_order_seq_cst));
+
+        for (unsigned j = 0; j < WRITE_THREAD+1; j++) {
+            if (mem_arbiter.test(j)) {
+                // mtx[j].lock();
+                for (unsigned k = 0; k < NUM_ELEM; k++) {
+                    // outfile << counter << " iterations = " << i << " mem " << j << " = " << mem[j][k];
+                    mem[j][k] = mem[j][k]+1;
+                    // outfile << " mem " << j << " = " << mem[j][k] << endl;
+                }
+                // mtx[j].unlock();
+
+                mem_arbiter.reset();
+                if (j == WRITE_THREAD) mem_arbiter.set(0);
+                else mem_arbiter.set(j+1);
+
+                break;
             }
-            // ping_mutex[id].unlock();
-            // ping_mutex[id+1].unlock();
-        } else {
-            // pong_mutex[id].lock();
-            // pong_mutex[id+1].lock();
-            for (unsigned j = 0; j < NUM_ELEM; j++) {
-                pong_mem[id+1][j] = pong_mem[id][j]+1;
-                // outfile << "iterations = " << i << " pong_mem = " << pong_mem[id][j] << " pong_mem = " << pong_mem[id+1][j] << endl;
-            }
-            // pong_mutex[id].unlock();
-            // pong_mutex[id+1].unlock();
         }
 
-        // Reset Compute <id> flag
+        // Reset Compute <id> valid flag
         compute_valid[id].clear(std::memory_order_seq_cst);
+
+        // Reset Compute <id+1> ready flag
+        compute_ready[id+1].clear(std::memory_order_seq_cst);
 
         // Test and Set Compute <id+1> flag
         while(compute_valid[id+1].test_and_set(std::memory_order_seq_cst));
 
-        pingpong = !pingpong;
+        // Test and Set Compute <id> ready flag
+        while(compute_ready[id].test_and_set(std::memory_order_seq_cst));
     }
 }
 
@@ -168,7 +193,7 @@ void host_input_write (unsigned exec_time_factor) {
 
         for (unsigned j = 0; j < NUM_ELEM; j++) {
             input_mem[j] = i+j;
-            // outfile << "iterations = " << i << " input_mem = " << input_mem[j] << endl;
+            // outfile << counter << " iterations = " << i << " input_mem = " << input_mem[j] << endl;
         }
 
         // Reset producer valid flag
@@ -193,10 +218,10 @@ void host_output_read (unsigned exec_time_factor) {
         while(!output_cons_valid.test(std::memory_order_seq_cst));
 
         for (unsigned j = 0; j < NUM_ELEM; j++) {
-            if (output_mem[j] != i+j+WRITE_THREAD+1) {
+            if (output_mem[j] != i+j+1+NUM_COMPUTE+1) {
                 errors++;
             }
-            // outfile << "iterations = " << i << " output_mem = " << output_mem[j] << " expected = " << i+j+WRITE_THREAD+1 << endl;
+            // outfile << counter << " iterations = " << i << " output_mem = " << output_mem[j] << " expected = " << i+j+WRITE_THREAD+1 << endl;
             // cout << "actual = " << output_mem[j] << " expected = " << i+j+WRITE_THREAD+1 << endl;
         }
 
@@ -204,6 +229,12 @@ void host_output_read (unsigned exec_time_factor) {
 
         // Reset consumer valid flag
         output_cons_valid.clear(std::memory_order_seq_cst);
+    }
+}
+
+void counter_func() {
+    while(true) {
+        counter++;
     }
 }
 
@@ -227,6 +258,8 @@ int main () {
     for (int i = 0; i < NUM_COMPUTE; i++) {
         compute_thread[i] = thread(compute_kernel, i, compute_factor[i]);
     }
+
+    // thread counter_thread(counter_func);
 
     // End threads
     host_input_thread.join();
